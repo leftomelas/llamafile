@@ -76,112 +76,6 @@
 
 using json = nlohmann::ordered_json;
 
-int32_t get_num_physical_cores() {
-    if (IsLinux()) {
-    // enumerate the set of thread siblings, num entries is num cores
-    std::unordered_set<std::string> siblings;
-    for (uint32_t cpu=0; cpu < UINT32_MAX; ++cpu) {
-        std::ifstream thread_siblings("/sys/devices/system/cpu/cpu"
-            + std::to_string(cpu) + "/topology/thread_siblings");
-        if (!thread_siblings.is_open()) {
-            break; // no more cpus
-        }
-        std::string line;
-        if (std::getline(thread_siblings, line)) {
-            siblings.insert(line);
-        }
-    }
-    if (!siblings.empty()) {
-        return static_cast<int32_t>(siblings.size());
-    }
-    }
-    int32_t num_physical_cores;
-    size_t len = sizeof(num_physical_cores);
-    int result = sysctlbyname("hw.perflevel0.physicalcpu", &num_physical_cores, &len, NULL, 0);
-    if (result == 0) {
-        return num_physical_cores;
-    }
-    result = sysctlbyname("hw.physicalcpu", &num_physical_cores, &len, NULL, 0);
-    if (result == 0) {
-        return num_physical_cores;
-    }
-    unsigned int n_threads = std::thread::hardware_concurrency();
-    return n_threads > 0 ? (n_threads <= 4 ? n_threads : n_threads / 2) : 4;
-}
-
-#if defined(__x86_64__) && (defined(__linux__) || defined(__COSMOPOLITAN__)) && !defined(__ANDROID__)
-#include <pthread.h>
-
-static void cpuid(unsigned leaf, unsigned subleaf,
-                  unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx) {
-    __asm__("movq\t%%rbx,%%rsi\n\t"
-            "cpuid\n\t"
-            "xchgq\t%%rbx,%%rsi"
-            : "=a"(*eax), "=S"(*ebx), "=c"(*ecx), "=d"(*edx)
-            : "0"(leaf), "2"(subleaf));
-}
-
-static int pin_cpu(int cpu) {
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    CPU_SET(cpu, &mask);
-    return pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask);
-}
-
-static bool is_hybrid_cpu(void) {
-    unsigned eax, ebx, ecx, edx;
-    cpuid(7, 0, &eax, &ebx, &ecx, &edx);
-    return !!(edx & (1u << 15));
-}
-
-static bool is_running_on_efficiency_core(void) {
-    unsigned eax, ebx, ecx, edx;
-    cpuid(0x1a, 0, &eax, &ebx, &ecx, &edx);
-    int intel_atom = 0x20;
-    int core_type = (eax & 0xff000000u) >> 24;
-    return core_type == intel_atom;
-}
-
-static int count_math_cpus(int cpu_count) {
-    int result = 0;
-    for (int cpu = 0; cpu < cpu_count; ++cpu) {
-        if (pin_cpu(cpu)) {
-            return -1;
-        }
-        if (is_running_on_efficiency_core()) {
-            continue; // efficiency cores harm lockstep threading
-        }
-        ++cpu; // hyperthreading isn't useful for linear algebra
-        ++result;
-    }
-    return result;
-}
-
-#endif // __x86_64__ && __linux__
-
-/**
- * Returns number of CPUs on system that are useful for math.
- */
-int cpu_get_num_math() {
-#if defined(__x86_64__) && (defined(__linux__) || defined(__COSMOPOLITAN__)) && !defined(__ANDROID__)
-    int cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
-    if (cpu_count < 1) {
-        return get_num_physical_cores();
-    }
-    if (is_hybrid_cpu()) {
-        cpu_set_t affinity;
-        if (!pthread_getaffinity_np(pthread_self(), sizeof(affinity), &affinity)) {
-            int result = count_math_cpus(cpu_count);
-            pthread_setaffinity_np(pthread_self(), sizeof(affinity), &affinity);
-            if (result > 0) {
-                return result;
-            }
-        }
-    }
-#endif
-    return get_num_physical_cores();
-}
-
 void process_escapes(std::string & input) {
     std::size_t input_len = input.length();
     std::size_t output_idx = 0;
@@ -949,8 +843,8 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.interactive = true;
         return true;
     }
-    if (arg == "--interactive-specials") {
-        params.interactive_specials = true;
+    if (arg == "-sp" || arg == "--special") {
+        params.special = true;
         return true;
     }
     if (arg == "--embedding") {
@@ -1007,6 +901,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "-fa" || arg == "--flash-attn") {
         params.flash_attn = true;
+        FLAG_flash_attn = true; // [jart]
         return true;
     }
     if (arg == "--color") {
@@ -1468,8 +1363,8 @@ void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
     printf("  -h, --help            show this help message and exit\n");
     printf("  --version             show version and build info\n");
     printf("  -i, --interactive     run in interactive mode\n");
-    printf("  --interactive-specials allow special tokens in user text, in interactive mode\n");
     printf("  --interactive-first   run in interactive mode and wait for input right away\n");
+    printf("  -sp, --special        special tokens output enabled\n");
     printf("  -cnv, --conversation  run in conversation mode (does not print special tokens and suffix/prefix)\n");
     printf("  -ins, --instruct      run in instruction mode (use with Alpaca models)\n");
     printf("  -cml, --chatml        run in chatml mode (use with ChatML-compatible models)\n");
@@ -2725,7 +2620,7 @@ void dump_non_result_info_yaml(FILE * stream, const gpt_params & params, const l
     dump_string_yaml_multiline(stream, "in_suffix", params.input_prefix.c_str());
     fprintf(stream, "instruct: %s # default: false\n", params.instruct ? "true" : "false");
     fprintf(stream, "interactive: %s # default: false\n", params.interactive ? "true" : "false");
-    fprintf(stream, "interactive_specials: %s # default: false\n", params.interactive_specials ? "true" : "false");
+    fprintf(stream, "specials: %s # default: false\n", params.special ? "true" : "false");
     fprintf(stream, "interactive_first: %s # default: false\n", params.interactive_first ? "true" : "false");
     fprintf(stream, "keep: %d # default: 0\n", params.n_keep);
     fprintf(stream, "logdir: %s # default: unset (no logging)\n", params.logdir.c_str());

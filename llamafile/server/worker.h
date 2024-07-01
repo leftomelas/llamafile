@@ -1,5 +1,5 @@
-// -*- mode:c;indent-tabs-mode:nil;c-basic-offset:4;coding:utf-8 -*-
-// vi: set et ft=c ts=4 sts=4 sw=4 fenc=utf-8 :vi
+// -*- mode:c++;indent-tabs-mode:nil;c-basic-offset:4;coding:utf-8 -*-
+// vi: set et ft=cpp ts=4 sts=4 sw=4 fenc=utf-8 :vi
 //
 // Copyright 2024 Mozilla Foundation
 //
@@ -15,6 +15,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "llamafile.h"
+#pragma once
+#include "client.h"
+#include "server.h"
+#include <cosmo.h>
+#include <pthread.h>
 
-bool FLAG_unsecure;
+#define WORKER(e) DLL_CONTAINER(Worker, elem, e)
+
+struct Worker
+{
+    Server* server;
+    Dll elem;
+    pthread_t th = 0;
+    bool working = false;
+    Client client;
+
+    Worker(Server*);
+    void run();
+    void begin();
+    void handle(void);
+    void end();
+    void retire();
+    void kill();
+};
